@@ -1,210 +1,1162 @@
 import csv
-import statistics
-import sys
 from collections import defaultdict
-
-try:
-    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
-except Exception:
-    pass
+from pathlib import Path
 
 
-def out(msg=""):
-    print(msg, flush=True)
+# ============================================================
+# 기본 설정
+# ============================================================
+
+BASE = Path(__file__).resolve().parent
+
+LOCAL_CSV = BASE / "benchmark_local_v3.csv"
+LUNA_CSV = BASE / "benchmark_luna_v2.csv"
+GEMINI_CSV = BASE / "benchmark_gemini.csv"
+
+SUMMARY_CSV = BASE / "summary.csv"
+
+CHAR_LIMIT = 3000
+
+COMMON_QIDS = {
+    "q03",
+    "q06",
+    "q07",
+    "q09",
+    "q10",
+}
 
 
-CSV_PATH = "benchmark_local_v2.csv"
-W = 15
+# ============================================================
+# 공통 유틸
+# ============================================================
+
+def clean(value):
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
-def load(path):
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+def to_float(value):
+    value = clean(value)
+
+    if not value:
+        return None
+
+    try:
+        return float(value.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
 
 
-def num(rows, key, cast=float):
-    vals = []
-    for r in rows or []:
-        v = r.get(key, "")
-        if v not in ("", None):
-            try:
-                vals.append(cast(v))
-            except (ValueError, TypeError):
-                pass
-    return vals
+def to_int(value):
+    number = to_float(value)
+
+    if number is None:
+        return None
+
+    return int(number)
 
 
-def row_line(name, cells, width=W, pad=16):
-    return f"{name:<{pad}}" + "".join(f"{c:>{width}}" for c in cells)
+def mean(values):
+    values = [
+        value
+        for value in values
+        if value is not None
+    ]
+
+    if not values:
+        return None, 0
+
+    return sum(values) / len(values), len(values)
 
 
-def fmt(vals, spec="{:.0f}"):
-    return spec.format(statistics.mean(vals)) if vals else "-"
+def fmt_num(value, digits=2):
+    if value is None:
+        return "-"
+
+    return f"{value:.{digits}f}"
 
 
-out("오픈소스 모델 리포트")
+def fmt_pct(value):
+    if value is None:
+        return "-"
 
-try:
-    rows = load(CSV_PATH)
-except FileNotFoundError:
-    out(f"{CSV_PATH} 파일이 없습니다.")
-    raise SystemExit(1)
+    return f"{value:.1f}%"
 
-if not rows:
-    out(f"{CSV_PATH}에 기록이 없습니다.")
-    raise SystemExit(1)
 
-# ── 세션 선택 ───────────────────────────────────────────
-# 사용법:
-#   python 05.report.py            → 가장 마지막 세션만
-#   python 05.report.py all        → 전체 세션
-#   python 05.report.py 0915-1423  → 특정 세션
-sessions = []
-for r in rows:
-    s = (r.get("세션") or "").strip()
-    if s and s not in sessions:
-        sessions.append(s)
+def is_success(row):
+    status = clean(
+        row.get("상태")
+    ).lower()
 
-arg = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+    return status in {
+        "정상",
+        "ok",
+        "success",
+    }
 
-if arg.lower() == "all":
-    target = None
-elif arg:
-    if arg not in sessions:
-        out(f"세션 '{arg}'을(를) 찾을 수 없습니다.")
-        out(f"기록된 세션: {', '.join(sessions) or '없음'}")
-        raise SystemExit(1)
-    target = arg
-else:
-    target = sessions[-1] if sessions else None
 
-if target:
-    rows = [r for r in rows if (r.get("세션") or "").strip() == target]
-    out(f"세션 {target} (전체 {len(sessions)}개 중 1개)")
-    if len(sessions) > 1:
-        out(f"제외한 세션: {', '.join(s for s in sessions if s != target)}")
-else:
-    out(f"전체 세션 {len(sessions)}개 합산")
+def is_token_limit(row):
+    reason = clean(
+        row.get("종료사유")
+    ).lower()
 
-# ── 정상/제외 분류 ──────────────────────────────────────
-ok, bad = [], []
-for r in rows:
-    tok_val = str(r.get("출력토큰", ""))
-    if r.get("상태") == "정상" and tok_val.isdigit() and int(tok_val) > 0:
-        ok.append(r)
+    return (
+        "토큰한도" in reason
+        or "max_token" in reason
+        or "max token" in reason
+        or "length" == reason
+    )
+
+
+def is_over_limit(row):
+    flag = clean(
+        row.get("제약초과")
+    ).upper()
+
+    if flag == "Y":
+        return True
+
+    chars = to_int(
+        row.get("응답글자수")
+    )
+
+    return (
+        chars is not None
+        and chars > CHAR_LIMIT
+    )
+
+
+def model_name(row):
+    """
+    보고서에 표시할 모델 이름.
+
+    Local:
+        모델태그 -> 모델
+
+    Luna/Gemini:
+        모델ID -> 모델
+    """
+
+    for key in (
+        "모델ID",
+        "모델태그",
+        "모델",
+    ):
+        value = clean(
+            row.get(key)
+        )
+
+        if value:
+            return value
+
+    return "unknown"
+
+
+# ============================================================
+# CSV 읽기
+# ============================================================
+
+def read_csv(path):
+    if not path.exists():
+        print(
+            f"[없음] {path.name}"
+        )
+        return []
+
+    with path.open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+        rows = list(
+            csv.DictReader(f)
+        )
+
+    return rows
+
+
+def latest_session_rows(rows):
+    """
+    CSV의 가장 마지막 유효 세션만 선택한다.
+
+    CSV는 실행 순서대로 append된다는 전제에서
+    마지막 행의 세션을 현재 본 실험 세션으로 본다.
+    """
+
+    sessions = [
+        clean(row.get("세션"))
+        for row in rows
+        if clean(row.get("세션"))
+    ]
+
+    if not sessions:
+        return rows, "-"
+
+    latest = sessions[-1]
+
+    selected = [
+        row
+        for row in rows
+        if clean(row.get("세션")) == latest
+    ]
+
+    return selected, latest
+
+
+# ============================================================
+# 모델별 통계
+# ============================================================
+
+def aggregate(rows):
+    attempts = len(rows)
+
+    success_rows = [
+        row
+        for row in rows
+        if is_success(row)
+    ]
+
+    success = len(
+        success_rows
+    )
+
+    failure = (
+        attempts
+        - success
+    )
+
+    success_rate = (
+        success / attempts * 100
+        if attempts
+        else None
+    )
+
+    token_limit = sum(
+        1
+        for row in rows
+        if is_token_limit(row)
+    )
+
+    over_limit = sum(
+        1
+        for row in success_rows
+        if is_over_limit(row)
+    )
+
+    latency_mean, latency_n = mean([
+        to_float(
+            row.get("응답초")
+        )
+        for row in success_rows
+    ])
+
+    output_mean, output_n = mean([
+        to_float(
+            row.get("출력토큰")
+        )
+        for row in success_rows
+    ])
+
+    input_mean, input_n = mean([
+        to_float(
+            row.get("입력토큰")
+        )
+        for row in success_rows
+    ])
+
+    chars_mean, chars_n = mean([
+        to_float(
+            row.get("응답글자수")
+        )
+        for row in success_rows
+    ])
+
+    speed_mean, speed_n = mean([
+        to_float(
+            row.get("초당토큰")
+        )
+        for row in success_rows
+    ])
+
+    vram_mean, vram_n = mean([
+        to_float(
+            row.get("VRAM_MiB")
+        )
+        for row in success_rows
+    ])
+
+    reasoning_mean, reasoning_n = mean([
+        to_float(
+            row.get("추론토큰")
+        )
+        for row in success_rows
+        if clean(
+            row.get("추론토큰")
+        ) != ""
+    ])
+
+    cached_mean, cached_n = mean([
+        to_float(
+            row.get("캐시입력토큰")
+        )
+        for row in success_rows
+        if clean(
+            row.get("캐시입력토큰")
+        ) != ""
+    ])
+
+    return {
+        "attempts": attempts,
+
+        "success": success,
+        "failure": failure,
+        "success_rate": success_rate,
+
+        "token_limit": token_limit,
+        "over_limit": over_limit,
+
+        "latency_mean": latency_mean,
+        "latency_n": latency_n,
+
+        "input_mean": input_mean,
+        "input_n": input_n,
+
+        "output_mean": output_mean,
+        "output_n": output_n,
+
+        "chars_mean": chars_mean,
+        "chars_n": chars_n,
+
+        "speed_mean": speed_mean,
+        "speed_n": speed_n,
+
+        "vram_mean": vram_mean,
+        "vram_n": vram_n,
+
+        "reasoning_mean": reasoning_mean,
+        "reasoning_n": reasoning_n,
+
+        "cached_mean": cached_mean,
+        "cached_n": cached_n,
+    }
+
+
+# ============================================================
+# 모델 그룹화
+# ============================================================
+
+def group_models(rows):
+    groups = defaultdict(list)
+
+    for row in rows:
+        groups[
+            model_name(row)
+        ].append(row)
+
+    return dict(groups)
+
+
+# ============================================================
+# 출력
+# ============================================================
+
+def print_section(
+    title,
+    groups,
+    role,
+    session,
+):
+    print()
+    print(
+        "=" * 100
+    )
+    print(title)
+    print(
+        "=" * 100
+    )
+
+    print(
+        f"세션: {session}"
+    )
+
+    print(
+        f"구분: {role}"
+    )
+
+    print()
+
+    header = (
+        f"{'모델':<22}"
+        f"{'시도':>6}"
+        f"{'성공':>6}"
+        f"{'성공률':>9}"
+        f"{'토큰한도':>10}"
+        f"{'>3000자':>9}"
+        f"{'응답초':>11}"
+        f"{'출력tok':>11}"
+        f"{'글자수':>11}"
+        f"{'tok/s':>10}"
+    )
+
+    print(header)
+    print("-" * 100)
+
+    summaries = []
+
+    for model in sorted(
+        groups
+    ):
+        stats = aggregate(
+            groups[model]
+        )
+
+        print(
+            f"{model:<22}"
+            f"{stats['attempts']:>6}"
+            f"{stats['success']:>6}"
+            f"{fmt_pct(stats['success_rate']):>9}"
+            f"{stats['token_limit']:>10}"
+            f"{stats['over_limit']:>9}"
+            f"{fmt_num(stats['latency_mean']):>11}"
+            f"{fmt_num(stats['output_mean'], 1):>11}"
+            f"{fmt_num(stats['chars_mean'], 1):>11}"
+            f"{fmt_num(stats['speed_mean'], 1):>10}"
+        )
+
+        summaries.append(
+            (
+                model,
+                stats,
+            )
+        )
+
+    print()
+    print("[지표별 n]")
+
+    for model, stats in summaries:
+        print(
+            f"  {model}: "
+            f"응답초 n={stats['latency_n']}, "
+            f"출력토큰 n={stats['output_n']}, "
+            f"글자수 n={stats['chars_n']}, "
+            f"tok/s n={stats['speed_n']}"
+        )
+
+    return summaries
+
+
+# ============================================================
+# 추가 상세 출력
+# ============================================================
+
+def print_local_detail(
+    groups,
+):
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "[LOCAL 성능 상세]"
+    )
+    print(
+        "=" * 100
+    )
+
+    for model in sorted(
+        groups
+    ):
+        stats = aggregate(
+            groups[model]
+        )
+
+        print()
+        print(
+            f"[{model}]"
+        )
+
+        print(
+            f"  평균 입력 토큰 : "
+            f"{fmt_num(stats['input_mean'], 1)} "
+            f"(n={stats['input_n']})"
+        )
+
+        print(
+            f"  평균 출력 토큰 : "
+            f"{fmt_num(stats['output_mean'], 1)} "
+            f"(n={stats['output_n']})"
+        )
+
+        print(
+            f"  평균 응답 시간 : "
+            f"{fmt_num(stats['latency_mean'])}초 "
+            f"(n={stats['latency_n']})"
+        )
+
+        print(
+            f"  평균 생성 속도 : "
+            f"{fmt_num(stats['speed_mean'], 1)} tok/s "
+            f"(n={stats['speed_n']})"
+        )
+
+        print(
+            f"  평균 VRAM      : "
+            f"{fmt_num(stats['vram_mean'], 1)} MiB "
+            f"(n={stats['vram_n']})"
+        )
+
+        print(
+            f"  평균 응답 길이 : "
+            f"{fmt_num(stats['chars_mean'], 1)}자 "
+            f"(n={stats['chars_n']})"
+        )
+
+        print(
+            f"  3000자 초과    : "
+            f"{stats['over_limit']}건"
+        )
+
+        print(
+            f"  토큰한도 종료  : "
+            f"{stats['token_limit']}건"
+        )
+
+
+def print_cloud_detail(
+    title,
+    rows,
+):
+    print()
+    print(
+        "=" * 100
+    )
+    print(title)
+    print(
+        "=" * 100
+    )
+
+    groups = group_models(
+        rows
+    )
+
+    for model in sorted(
+        groups
+    ):
+        stats = aggregate(
+            groups[model]
+        )
+
+        print()
+        print(
+            f"[{model}]"
+        )
+
+        print(
+            f"  성공           : "
+            f"{stats['success']} / "
+            f"{stats['attempts']} "
+            f"({fmt_pct(stats['success_rate'])})"
+        )
+
+        print(
+            f"  평균 응답 시간 : "
+            f"{fmt_num(stats['latency_mean'])}초 "
+            f"(n={stats['latency_n']})"
+        )
+
+        print(
+            f"  평균 입력 토큰 : "
+            f"{fmt_num(stats['input_mean'], 1)} "
+            f"(n={stats['input_n']})"
+        )
+
+        print(
+            f"  평균 출력 토큰 : "
+            f"{fmt_num(stats['output_mean'], 1)} "
+            f"(n={stats['output_n']})"
+        )
+
+        print(
+            f"  평균 응답 길이 : "
+            f"{fmt_num(stats['chars_mean'], 1)}자 "
+            f"(n={stats['chars_n']})"
+        )
+
+        print(
+            f"  평균 추론 토큰 : "
+            f"{fmt_num(stats['reasoning_mean'], 1)} "
+            f"(n={stats['reasoning_n']})"
+        )
+
+        print(
+            f"  평균 캐시 입력 : "
+            f"{fmt_num(stats['cached_mean'], 1)} "
+            f"(n={stats['cached_n']})"
+        )
+
+        print(
+            f"  3000자 초과    : "
+            f"{stats['over_limit']}건"
+        )
+
+        print(
+            f"  토큰한도 종료  : "
+            f"{stats['token_limit']}건"
+        )
+
+
+# ============================================================
+# Cloud 설정 이상 관측
+# ============================================================
+
+def find_output_limit_anomalies(
+    provider,
+    rows,
+):
+    anomalies = []
+
+    for row in rows:
+        output_tokens = to_int(
+            row.get("출력토큰")
+        )
+
+        max_tokens = to_int(
+            row.get("max_output_tokens")
+        )
+
+        if (
+            output_tokens is not None
+            and max_tokens is not None
+            and output_tokens > max_tokens
+        ):
+            anomalies.append({
+                "provider": provider,
+                "session": clean(
+                    row.get("세션")
+                ),
+                "qid": clean(
+                    row.get("문제")
+                ),
+                "model": model_name(
+                    row
+                ),
+                "output_tokens": output_tokens,
+                "max_output_tokens": max_tokens,
+            })
+
+    return anomalies
+
+
+# ============================================================
+# summary.csv
+# ============================================================
+
+SUMMARY_FIELDS = [
+    "범위",
+    "구분",
+    "세션",
+    "모델",
+
+    "시도수",
+    "성공수",
+    "실패수",
+    "성공률_pct",
+
+    "토큰한도수",
+    "3000자초과수",
+
+    "평균응답초",
+    "응답초_n",
+
+    "평균입력토큰",
+    "입력토큰_n",
+
+    "평균출력토큰",
+    "출력토큰_n",
+
+    "평균응답글자수",
+    "글자수_n",
+
+    "평균초당토큰",
+    "초당토큰_n",
+
+    "평균VRAM_MiB",
+    "VRAM_n",
+
+    "평균추론토큰",
+    "추론토큰_n",
+
+    "평균캐시입력토큰",
+    "캐시입력토큰_n",
+]
+
+
+def summary_row(
+    scope,
+    role,
+    session,
+    model,
+    stats,
+):
+    return {
+        "범위": scope,
+        "구분": role,
+        "세션": session,
+        "모델": model,
+
+        "시도수": stats["attempts"],
+        "성공수": stats["success"],
+        "실패수": stats["failure"],
+
+        "성공률_pct": (
+            round(
+                stats["success_rate"],
+                2,
+            )
+            if stats["success_rate"] is not None
+            else ""
+        ),
+
+        "토큰한도수": stats["token_limit"],
+        "3000자초과수": stats["over_limit"],
+
+        "평균응답초": (
+            round(
+                stats["latency_mean"],
+                3,
+            )
+            if stats["latency_mean"] is not None
+            else ""
+        ),
+
+        "응답초_n": stats["latency_n"],
+
+        "평균입력토큰": (
+            round(
+                stats["input_mean"],
+                2,
+            )
+            if stats["input_mean"] is not None
+            else ""
+        ),
+
+        "입력토큰_n": stats["input_n"],
+
+        "평균출력토큰": (
+            round(
+                stats["output_mean"],
+                2,
+            )
+            if stats["output_mean"] is not None
+            else ""
+        ),
+
+        "출력토큰_n": stats["output_n"],
+
+        "평균응답글자수": (
+            round(
+                stats["chars_mean"],
+                2,
+            )
+            if stats["chars_mean"] is not None
+            else ""
+        ),
+
+        "글자수_n": stats["chars_n"],
+
+        "평균초당토큰": (
+            round(
+                stats["speed_mean"],
+                2,
+            )
+            if stats["speed_mean"] is not None
+            else ""
+        ),
+
+        "초당토큰_n": stats["speed_n"],
+
+        "평균VRAM_MiB": (
+            round(
+                stats["vram_mean"],
+                2,
+            )
+            if stats["vram_mean"] is not None
+            else ""
+        ),
+
+        "VRAM_n": stats["vram_n"],
+
+        "평균추론토큰": (
+            round(
+                stats["reasoning_mean"],
+                2,
+            )
+            if stats["reasoning_mean"] is not None
+            else ""
+        ),
+
+        "추론토큰_n": stats["reasoning_n"],
+
+        "평균캐시입력토큰": (
+            round(
+                stats["cached_mean"],
+                2,
+            )
+            if stats["cached_mean"] is not None
+            else ""
+        ),
+
+        "캐시입력토큰_n": stats["cached_n"],
+    }
+
+
+def write_summary(
+    local_all,
+    local_common,
+    luna_rows,
+    gemini_rows,
+    local_session,
+    luna_session,
+    gemini_session,
+):
+    output = []
+
+    for model, rows in sorted(
+        group_models(
+            local_all
+        ).items()
+    ):
+        output.append(
+            summary_row(
+                "Local 전체 10문항",
+                "핵심",
+                local_session,
+                model,
+                aggregate(rows),
+            )
+        )
+
+    for model, rows in sorted(
+        group_models(
+            local_common
+        ).items()
+    ):
+        output.append(
+            summary_row(
+                "공통 5문항",
+                "핵심",
+                local_session,
+                model,
+                aggregate(rows),
+            )
+        )
+
+    for model, rows in sorted(
+        group_models(
+            luna_rows
+        ).items()
+    ):
+        output.append(
+            summary_row(
+                "공통 5문항",
+                "핵심",
+                luna_session,
+                model,
+                aggregate(rows),
+            )
+        )
+
+    for model, rows in sorted(
+        group_models(
+            gemini_rows
+        ).items()
+    ):
+        output.append(
+            summary_row(
+                "공통 5문항",
+                "참고",
+                gemini_session,
+                model,
+                aggregate(rows),
+            )
+        )
+
+    with SUMMARY_CSV.open(
+        "w",
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=SUMMARY_FIELDS,
+        )
+
+        writer.writeheader()
+        writer.writerows(
+            output
+        )
+
+    print()
+    print(
+        f"[저장] {SUMMARY_CSV.name}"
+    )
+
+
+# ============================================================
+# main
+# ============================================================
+
+def main():
+
+    # --------------------------------------------------------
+    # 원본 읽기
+    # --------------------------------------------------------
+
+    local_raw = read_csv(
+        LOCAL_CSV
+    )
+
+    luna_raw = read_csv(
+        LUNA_CSV
+    )
+
+    gemini_raw = read_csv(
+        GEMINI_CSV
+    )
+
+    # --------------------------------------------------------
+    # 최신 세션만 선택
+    # --------------------------------------------------------
+
+    local_rows, local_session = latest_session_rows(
+        local_raw
+    )
+
+    luna_rows, luna_session = latest_session_rows(
+        luna_raw
+    )
+
+    gemini_rows, gemini_session = latest_session_rows(
+        gemini_raw
+    )
+
+    # --------------------------------------------------------
+    # Local 공통 5문항
+    # --------------------------------------------------------
+
+    local_common = [
+        row
+        for row in local_rows
+        if clean(
+            row.get("문제")
+        ) in COMMON_QIDS
+    ]
+
+    # --------------------------------------------------------
+    # 기본 데이터 확인
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "#" * 100
+    )
+    print(
+        "LLM BENCHMARK 정량평가"
+    )
+    print(
+        "#" * 100
+    )
+
+    print()
+    print(
+        "[입력 데이터]"
+    )
+
+    print(
+        f"  Local  : {LOCAL_CSV.name} "
+        f"/ 세션 {local_session} "
+        f"/ {len(local_rows)}건"
+    )
+
+    print(
+        f"  Luna   : {LUNA_CSV.name} "
+        f"/ 세션 {luna_session} "
+        f"/ {len(luna_rows)}건"
+    )
+
+    print(
+        f"  Gemini : {GEMINI_CSV.name} "
+        f"/ 세션 {gemini_session} "
+        f"/ {len(gemini_rows)}건 "
+        f"(참고용)"
+    )
+
+    # --------------------------------------------------------
+    # 1. Local 전체
+    # --------------------------------------------------------
+
+    local_groups = group_models(
+        local_rows
+    )
+
+    print_section(
+        "[1] Local 전체 10문항 × 2회",
+        local_groups,
+        "핵심 Local 비교",
+        local_session,
+    )
+
+    print_local_detail(
+        local_groups
+    )
+
+    # --------------------------------------------------------
+    # 2. Local 공통 5문항
+    # --------------------------------------------------------
+
+    local_common_groups = group_models(
+        local_common
+    )
+
+    print_section(
+        "[2] Local 공통 5문항만 추출",
+        local_common_groups,
+        "Local–Cloud 비교용",
+        local_session,
+    )
+
+    # --------------------------------------------------------
+    # 3. Luna
+    # --------------------------------------------------------
+
+    luna_groups = group_models(
+        luna_rows
+    )
+
+    print_section(
+        "[3] Luna 공통 5문항",
+        luna_groups,
+        "핵심 Cloud 비교",
+        luna_session,
+    )
+
+    print_cloud_detail(
+        "[LUNA 상세]",
+        luna_rows,
+    )
+
+    # --------------------------------------------------------
+    # 4. Gemini 참고
+    # --------------------------------------------------------
+
+    gemini_groups = group_models(
+        gemini_rows
+    )
+
+    print_section(
+        "[4] Gemini 공통 5문항",
+        gemini_groups,
+        "참고용 Cloud 실험",
+        gemini_session,
+    )
+
+    print_cloud_detail(
+        "[GEMINI 참고 상세]",
+        gemini_rows,
+    )
+
+    # --------------------------------------------------------
+    # 5. Cloud API 이상 관측
+    # --------------------------------------------------------
+
+    anomalies = []
+
+    anomalies.extend(
+        find_output_limit_anomalies(
+            "Luna",
+            luna_rows,
+        )
+    )
+
+    anomalies.extend(
+        find_output_limit_anomalies(
+            "Gemini",
+            gemini_rows,
+        )
+    )
+
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "[5] 기록 이상/관측 확인"
+    )
+    print(
+        "=" * 100
+    )
+
+    if anomalies:
+        for item in anomalies:
+            print(
+                f"  ⚠ {item['provider']} "
+                f"{item['model']} "
+                f"{item['qid']} / "
+                f"출력토큰={item['output_tokens']} > "
+                f"max_output_tokens="
+                f"{item['max_output_tokens']}"
+            )
+
+        print()
+        print(
+            "  위 값은 CSV를 수정하지 않고 "
+            "API가 반환한 실측값 그대로 유지합니다."
+        )
+
     else:
-        bad.append(r)
+        print(
+            "  특이 기록 없음"
+        )
 
-out(f"정상 {len(ok)}건 / 제외 {len(bad)}건")
+    # --------------------------------------------------------
+    # 6. summary.csv
+    # --------------------------------------------------------
 
-if not ok:
-    out("집계할 정상 기록이 없습니다.")
-    raise SystemExit(1)
+    write_summary(
+        local_rows,
+        local_common,
+        luna_rows,
+        gemini_rows,
+        local_session,
+        luna_session,
+        gemini_session,
+    )
 
-labels = sorted({r.get("모델", "") for r in ok})
-qids = sorted({r.get("문제", "") for r in ok})
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "정량평가 완료"
+    )
+    print(
+        "=" * 100
+    )
 
-by_model = {l: [r for r in ok if r.get("모델", "") == l] for l in labels}
-cell = defaultdict(list)
-for r in ok:
-    cell[(r.get("문제", ""), r.get("모델", ""))].append(r)
+    print(
+        "핵심 비교: Local 3개 모델 + Luna"
+    )
 
-bar = "-" * (16 + W * len(labels))
+    print(
+        "Gemini: 참고 실험으로 별도 해석"
+    )
 
-# ── 지표 비교 ────────────────────────────────────────────
-out("")
-out(f"{'':16}" + "".join(f"{l:>{W}}" for l in labels))
-out(bar)
+    print(
+        "정성 품질 점수는 이 결과와 분리하여 "
+        "07.scoring.py에서 평가합니다."
+    )
 
-metrics = [
-    ("측정 건수",     lambda rs: f"{len(rs)}"),
-    ("평균 출력토큰",  lambda rs: fmt(num(rs, "출력토큰", int))),
-    ("최소-최대",     lambda rs: (f"{min(num(rs, '출력토큰', int))}-"
-                               f"{max(num(rs, '출력토큰', int))}")
-                               if num(rs, "출력토큰", int) else "-"),
-    ("출력 편차",     lambda rs: (f"{statistics.stdev(num(rs, '출력토큰', int)):.0f}"
-                               if len(num(rs, "출력토큰", int)) > 1 else "-")),
-    ("평균 글자수",   lambda rs: fmt(num(rs, "응답글자수", int))),
-    ("제약 초과",     lambda rs: f"{sum(1 for r in rs if r.get('제약초과') == 'Y')}/{len(rs)}"),
-    ("평균 응답초",   lambda rs: fmt(num(rs, "응답초"), "{:.1f}")),
-    ("최장 응답초",   lambda rs: (f"{max(num(rs, '응답초')):.1f}"
-                              if num(rs, "응답초") else "-")),
-    ("평균 tok/s",   lambda rs: fmt(num(rs, "초당토큰"), "{:.1f}")),
-    ("잘림 건수",     lambda rs: f"{sum(1 for r in rs if r.get('종료사유') == '토큰한도')}"),
-    ("총 출력토큰",   lambda rs: (f"{sum(num(rs, '출력토큰', int)):,}"
-                              if num(rs, "출력토큰", int) else "-")),
-]
 
-for name, fn in metrics:
-    out(row_line(name, [fn(by_model[l]) for l in labels]))
-
-# ── 문제별 표 ───────────────────────────────────────────
-views = [
-    ("문제별 출력토큰", "출력토큰",   int,   "{:.0f}"),
-    ("문제별 글자수",  "응답글자수", int,   "{:.0f}"),
-    ("문제별 응답초",  "응답초",    float, "{:.1f}"),
-]
-
-for title, key, cast, spec in views:
-    out("")
-    out(f"{title:16}" + "".join(f"{l:>{W}}" for l in labels))
-    out(bar)
-    for qid in qids:
-        cells = []
-        for l in labels:
-            rs = cell.get((qid, l))
-            cells.append(fmt(num(rs, key, cast), spec) if rs else "-")
-        out(row_line(qid, cells))
-
-# ── 회차 수 (셀별 집계 건수) ────────────────────────────
-counts = {(q, l): len(cell.get((q, l), [])) for q in qids for l in labels}
-if len(set(counts.values())) > 1:
-    out("")
-    out(f"{'문제별 회차수':16}" + "".join(f"{l:>{W}}" for l in labels))
-    out(bar)
-    for qid in qids:
-        out(row_line(qid, [str(counts[(qid, l)]) for l in labels]))
-    out("  주의: 회차 수가 셀마다 다릅니다. 평균 비교 시 감안하세요.")
-
-# ── 회차 편차 ───────────────────────────────────────────
-if any(len(cell.get((q, l), [])) > 1 for q in qids for l in labels):
-    out("")
-    out(f"{'문제별 회차편차':16}" + "".join(f"{l:>{W}}" for l in labels))
-    out(bar)
-    for qid in qids:
-        cells = []
-        for l in labels:
-            vals = num(cell.get((qid, l), []), "출력토큰", int)
-            cells.append(f"+-{statistics.stdev(vals):.0f}" if len(vals) > 1 else "-")
-        out(row_line(qid, cells))
-
-# ── 이상 행 ─────────────────────────────────────────────
-if bad:
-    out("")
-    out("확인 필요")
-    out(bar)
-    for r in bad:
-        why = (r.get("오류") or r.get("상태") or "")[:40]
-        out(f"  {r.get('문제') or '-':<5}{r.get('모델', ''):<14}"
-            f"run{r.get('회차') or '-':<4}{why}")
-
-cut_rows = [r for r in ok if r.get("종료사유") == "토큰한도"]
-if cut_rows:
-    out("")
-    out("잘린 응답")
-    out(bar)
-    for r in cut_rows:
-        out(f"  {r['문제']:<5}{r['모델']:<14}run{r['회차']:<4}{r.get('원문경로', '')}")
-
-over_rows = [r for r in ok if r.get("제약초과") == "Y"]
-if over_rows:
-    out("")
-    out("글자수 초과")
-    out(bar)
-    for r in over_rows:
-        out(f"  {r['문제']:<5}{r['모델']:<14}run{r['회차']:<4}"
-            f"{r['응답글자수']}자")
-
-out("")
-out(f"집계 {len(ok)}건 / 모델 {len(labels)}종")
-out("")
+if __name__ == "__main__":
+    main()
