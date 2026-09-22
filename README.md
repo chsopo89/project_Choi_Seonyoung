@@ -1,4 +1,4 @@
-# 네트워크 이슈 대응 챗봇을 위한 Local LLM과 Cloud LLM 비교
+# 네트워크 이슈 대응 챗봇을 활용한 Local LLM과 Cloud LLM 비교
 
 ## 1. 프로젝트 개요
 
